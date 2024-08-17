@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RAG System SSE Demo</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        #output {
+            white-space: pre-wrap;
+            border: 1px solid #ccc;
+            padding: 10px;
+            min-height: 200px;
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+    <h1>RAG System SSE Demo</h1>
+    <input type="text" id="question" placeholder="Enter your question" style="width: 70%;">
+    <button onclick="askQuestion()">Ask</button>
+    <div id="output"></div>
+
+    <script>
+        function askQuestion() {
+            const question = document.getElementById('question').value;
+            const output = document.getElementById('output');
+            output.textContent = ''; // Clear previous output
+
+            console.log("Connecting to EventSource...");
+            const eventSource = new EventSource(`/query?question=${encodeURIComponent(question)}`);
+
+            eventSource.onopen = function(event) {
+                console.log("Connection opened");
+                output.textContent += "Connection opened\n";
+            };
+
+            eventSource.onmessage = function(event) {
+                console.log("Received message:", event.data);
+                const data = JSON.parse(event.data);
+                if (data.response === "[DONE]") {
+                    console.log("Received [DONE] message");
+                    eventSource.close();
+                    output.textContent += "\n[Response Complete]";
+                } else if (data.error) {
+                    console.error("Received error:", data.error);
+                    output.textContent += `\nError: ${data.error}`;
+                    eventSource.close();
+                } else {
+                    output.textContent += data.response;
+                }
+            };
+
+            eventSource.onerror = function(error) {
+                console.error("EventSource failed:", error);
+                output.textContent += "\nConnection error. Please try again.";
+                output.textContent += "\nError details: " + JSON.stringify(error);
+                eventSource.close();
+            };
+        }
+    </script>
+</body>
+</html>
