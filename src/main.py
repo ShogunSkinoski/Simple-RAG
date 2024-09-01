@@ -1,11 +1,23 @@
-from fastapi import FastAPI, Depends, Request
+import io
+import os
+import cv2
+from fastapi import FastAPI, Depends, Request, File, UploadFile
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
+import numpy as np
 import uvicorn
 from rag_system import RAGSystem
 from dotenv import load_dotenv
 import json
 import logging
+from ocr import OCR
+from models import *
+from langchain_anthropic import ChatAnthropic
+from langchain.output_parsers import PydanticOutputParser
+from langchain.prompts import ChatPromptTemplate
+from pydantic import ValidationError
+
+from src.models import ReceiptAnalysisResponse
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -15,8 +27,9 @@ load_dotenv()
 app = FastAPI()
 pdf_path = "data"
 rag_system = RAGSystem(pdf_path)
+ocr = OCR("models/best.pt")
+chat_model = ChatAnthropic(model="claude-3-sonnet-20240229", anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"))
 
-# Mount the static files directory
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 def get_rag_system():
@@ -48,5 +61,90 @@ async def query(request: Request, question: str, rag_system: RAGSystem = Depends
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
+def salvage_data(raw_data):
+    try:
+        return ReceiptAnalysisResponse(**raw_data)
+    except ValidationError as e:
+        logger.warning(f"Validation error: {e}")
+        salvaged_data = {}
+        for field in ReceiptAnalysisResponse.__fields__:
+            if field in raw_data:
+                if field == 'receipt' and isinstance(raw_data[field], dict):
+                    salvaged_receipt = {}
+                    for receipt_field in Receipt.__fields__:
+                        if receipt_field in raw_data[field]:
+                            if receipt_field == 'items' and isinstance(raw_data[field][receipt_field], list):
+                                salvaged_items = []
+                                for item in raw_data[field][receipt_field]:
+                                    try:
+                                        salvaged_items.append(Item(**item))
+                                    except ValidationError:
+                                        pass
+                                salvaged_receipt['items'] = salvaged_items
+                            else:
+                                salvaged_receipt[receipt_field] = raw_data[field][receipt_field]
+                    salvaged_data['receipt'] = Receipt(**salvaged_receipt)
+                else:
+                    salvaged_data[field] = raw_data[field]
+        return ReceiptAnalysisResponse(**salvaged_data)
+
+@app.post("/receipt-analysis", response_model=ReceiptAnalysisResponse)
+async def receipt_analysis(file: UploadFile = File(...)):
+    try:
+        if not file.filename.lower().endswith((".jpg", ".jpeg")):
+            return {"error": "Only JPG files are supported"}
+
+        contents = await file.read()
+        image_stream = io.BytesIO(contents)
+        image_np = np.frombuffer(image_stream.getvalue(), np.uint8)
+        image = cv2.imdecode(image_np, cv2.IMREAD_COLOR)
+
+        if image is None:
+            return {"error": "Failed to decode the image"}
+
+        extracted_text = ocr.get_receipt_info(image)
+        
+        parser = PydanticOutputParser(pydantic_object=ReceiptAnalysisResponse)
+
+        prompt = ChatPromptTemplate.from_template(
+            """Here's the text extracted from a receipt. Please format it into the specified structure. For the following fields, if the information is not explicitly provided, make an educated guess based on the context:
+
+            - description (of the transaction)
+            - country (of the merchant)
+            - city (of the merchant)
+            - itemDescription (for each item)
+            - category (for each item)
+            - generalCategory (for each item)
+
+            For these fields, use your knowledge to infer the most likely values. If you're unsure about any other field, leave it as null or an empty string.
+
+            Extracted text:
+            {text}
+
+            {format_instructions}
+
+            Remember to make educated guesses for the specified fields when the information is not explicitly provided in the receipt."""
+        )
+
+        formatted_prompt = prompt.format(
+            text=extracted_text,
+            format_instructions=parser.get_format_instructions()
+        )
+
+        output = chat_model.predict(formatted_prompt)
+        
+        try:
+            parsed_output = parser.parse(output)
+        except ValidationError as e:
+            logger.warning(f"Validation error: {e}")
+            raw_data = json.loads(output)
+            parsed_output = salvage_data(raw_data)
+
+        return parsed_output
+    
+    except Exception as e:
+        logger.error(f"Error during receipt analysis: {str(e)}", exc_info=True)
+        return {"error": f"An error occurred during processing: {str(e)}"}
+
 if __name__ == "__main__":
-    rag_system.update_user_documents()
+    uvicorn.run(app, host="localhost", port=8000)
