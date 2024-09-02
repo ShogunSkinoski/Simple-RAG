@@ -1,5 +1,6 @@
 import io
 import os
+import re
 import cv2
 from fastapi import FastAPI, Depends, Request, File, UploadFile
 from fastapi.responses import StreamingResponse, FileResponse
@@ -23,11 +24,10 @@ logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 load_dotenv()
-
+ocr = OCR(lang='en') 
 app = FastAPI()
 pdf_path = "data"
 rag_system = RAGSystem(pdf_path)
-ocr = OCR("models/best.pt")
 chat_model = ChatAnthropic(model="claude-3-sonnet-20240229", anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -91,8 +91,8 @@ def salvage_data(raw_data):
 @app.post("/receipt-analysis", response_model=ReceiptAnalysisResponse)
 async def receipt_analysis(file: UploadFile = File(...)):
     try:
-        if not file.filename.lower().endswith((".jpg", ".jpeg")):
-            return {"error": "Only JPG files are supported"}
+        if not file.filename.lower().endswith((".jpg", ".jpeg", ".png")):
+            return {"error": "Only JPG and PNG files are supported"}
 
         contents = await file.read()
         image_stream = io.BytesIO(contents)
@@ -107,23 +107,12 @@ async def receipt_analysis(file: UploadFile = File(...)):
         parser = PydanticOutputParser(pydantic_object=ReceiptAnalysisResponse)
 
         prompt = ChatPromptTemplate.from_template(
-            """Here's the text extracted from a receipt. Please format it into the specified structure. For the following fields, if the information is not explicitly provided, make an educated guess based on the context:
-
-            - description (of the transaction)
-            - country (of the merchant)
-            - city (of the merchant)
-            - itemDescription (for each item)
-            - category (for each item)
-            - generalCategory (for each item)
-
-            For these fields, use your knowledge to infer the most likely values. If you're unsure about any other field, leave it as null or an empty string.
+            """Analyze the following text extracted from a receipt and format it into a JSON structure. Include educated guesses for missing information where appropriate. Return ONLY the JSON output, without any additional text or explanation.
 
             Extracted text:
             {text}
 
-            {format_instructions}
-
-            Remember to make educated guesses for the specified fields when the information is not explicitly provided in the receipt."""
+            {format_instructions}"""
         )
 
         formatted_prompt = prompt.format(
@@ -133,18 +122,29 @@ async def receipt_analysis(file: UploadFile = File(...)):
 
         output = chat_model.predict(formatted_prompt)
         
+        def extract_json(text):
+            match = re.search(r'\{.*\}', text, re.DOTALL)
+            if match:
+                return match.group()
+            return text
+
         try:
-            parsed_output = parser.parse(output)
+            json_output = extract_json(output)
+            parsed_output = parser.parse(json_output)
         except ValidationError as e:
             logger.warning(f"Validation error: {e}")
-            raw_data = json.loads(output)
-            parsed_output = salvage_data(raw_data)
+            try:
+                raw_data = json.loads(json_output)
+                parsed_output = salvage_data(raw_data)
+            except json.JSONDecodeError:
+                logger.error("Failed to parse JSON from LLM output")
+                return {"error": "Failed to process the receipt"}
 
         return parsed_output
     
     except Exception as e:
         logger.error(f"Error during receipt analysis: {str(e)}", exc_info=True)
         return {"error": f"An error occurred during processing: {str(e)}"}
-
+    
 if __name__ == "__main__":
     uvicorn.run(app, host="localhost", port=8000)
