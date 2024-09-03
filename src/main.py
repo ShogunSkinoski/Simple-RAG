@@ -89,12 +89,12 @@ def salvage_data(raw_data):
         return ReceiptAnalysisResponse(**salvaged_data)
 
 @app.post("/receipt-analysis", response_model=ReceiptAnalysisResponse)
-async def receipt_analysis(file: UploadFile = File(...)):
+async def receipt_analysis(image: UploadFile = File(...)):
     try:
-        if not file.filename.lower().endswith((".jpg", ".jpeg", ".png")):
+        if not image.filename.lower().endswith((".jpg", ".jpeg", ".png")):
             return {"error": "Only JPG and PNG files are supported"}
 
-        contents = await file.read()
+        contents = await image.read()
         image_stream = io.BytesIO(contents)
         image_np = np.frombuffer(image_stream.getvalue(), np.uint8)
         image = cv2.imdecode(image_np, cv2.IMREAD_COLOR)
@@ -107,8 +107,15 @@ async def receipt_analysis(file: UploadFile = File(...)):
         parser = PydanticOutputParser(pydantic_object=ReceiptAnalysisResponse)
 
         prompt = ChatPromptTemplate.from_template(
-            """Analyze the following text extracted from a receipt and format it into a JSON structure. Include educated guesses for missing information where appropriate. Return ONLY the JSON output, without any additional text or explanation.
-
+            """Analyze the following text extracted from a receipt and format it into a JSON structure. Include educated guesses for missing information where appropriate. Return ONLY the JSON output without any additional text or explanation. 
+                For the following fields, if the information is not explicitly provided, make an educated guess based on the context:
+            - description (of the transaction)
+            - country (of the merchant)
+            - city (of the merchant)
+            - itemDescription (for each item)
+            - category (for each item)
+            - generalCategory (for each item)
+            please provide only in Turkish 
             Extracted text:
             {text}
 
